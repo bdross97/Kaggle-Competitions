@@ -1,5 +1,5 @@
- library(dplyr)
-library(randomForest)
+#Loading necessary libraries#
+library(dplyr)
 library(caret)
 library(ggplot2)
 library(xgboost)
@@ -7,34 +7,35 @@ library(drat)
 library(Matrix)
 library(readr)
 library(data.table)
-mae <- function(pred, actual) {
-  error <- pred - actual
-  mae <- mean(abs(error))
-  print(mae)
-}
-training <- fread('../input/train_V2.csv')
+#reading in the training data#
+training <- fread("../input/train_V2.csv")
+#Clear observations from training set that are incomplete#
 training <- training[complete.cases(training),]
-
+#Mutate all game types to be either duos, squads or solos#
 training$matchType1 <- training$matchType
 training$matchType1 <- gsub(".*squad.*", "squad", training$matchType1)
 training$matchType1 <- gsub(".*solo.*", "solo", training$matchType1)
 training$matchType1 <- gsub(".*duo.*", "duo", training$matchType1)
 training$matchType1 <- gsub(".*flare.*", "squad", training$matchType1)
 training$matchType1 <- gsub(".*crash.*", "duo", training$matchType1)
+#Mutate features and remove dirty data#
 training$rankPoints <- ifelse(training$rankPoints == -1, 0, training$rankPoints)
 training$zombiecheater<- ifelse(training$walkDistance == 0 & training$winPlacePerc > 0, 1, 0)
 training$totaldist <- training$walkDistance + training$rideDistance + training$swimDistance
 training <- training[training$maxPlace > 1,]
 training$healsboosts <- training$heals  + training$boosts
 
-####winners####
+#Split data into solo set and duo/squads set#
 solo <- training[training$matchType1 == "solo" | training$matchType1 == "other" | training$matchType1 == "crash",]
 duosquad <- training[training$matchType1 == "squad" | training$matchType1 == "duo",]
+#*Memory Consolidation*#
+rm(training)
+gc()
 
 normalized<-function(m){
   (m - min(m))/(max(m)-min(m))
 }
-
+#Mutate features for solo set, normalize and rank all relevant variables#
 solodf <- subset(solo, select = -c(winPlacePerc, groupId, Id, matchType, matchType1, DBNOs, revives, teamKills))
 solodf <- solodf %>%
   group_by(matchId) %>%
@@ -44,10 +45,12 @@ solomutate <- solodf %>%
   mutate_all(.funs = funs(normalized, rank))
 solomutate <- as.data.frame(solomutate)
 solomutate <- cbind(solomutate, solo[,c("winPlacePerc")])
+#Remove any columns that couldn't be normalized#
 solomutate <- solomutate[,colSums(is.na(solomutate)) == 0]
 
 
 ####Solo Modeling####
+#Develop XGB matrices for XGBoost modeling#
 set.seed(1234)
 soloind <- sample(2, nrow(solomutate), replace = T, prob = c(0.8, 0.2))
 trainsolo <- solomutate[soloind==1,]
@@ -63,58 +66,55 @@ testsolom <- data.matrix(select(testsolo,-matchId, -winPlacePerc))
 test_label_solo <- testsolo$winPlacePerc
 test_matrix_solo <- xgb.DMatrix(data = as.matrix(testsolom), label = test_label_solo)
 
-# Parameters
+#List Parameters for XGBoost#
 xgb_params_solo <- list("objective" = "reg:linear",
-                   "eval_metric" = "mae")
+                        "eval_metric" = "mae")
 watchlist_solo <- list(train = train_matrix_solo, test = test_matrix_solo)
-
+#Train Model for Solo#
 bst_model <- xgb.train(params = xgb_params_solo,
                        data = train_matrix_solo,
-                       nrounds = 1000,
+                       nrounds = 1326,
                        watchlist = watchlist_solo,
                        eta = .3,
                        print_every_n = 25,
+                       max_depth = 6,
+                       subsample = 0.8,
+                       nthread=8,
+                       colsample_bytree = 0.8,
                        seed = 333)
 
-mat <- xgb.importance(feature_names = colnames(trainsolom), model = bst_model)
-xgb.plot.importance(importance_matrix = mat[1:20])
-
+rm(solomutate, trainsolo, testsolo, solo, solodf, train_matrix_solo, test_matrix_solo)
+gc()
 ####Squads Modeling####
-
+#Mutate features for squads and duos, normalize and rank relevant variables#
 squads <- subset(duosquad, select = -c(Id, matchType, matchType1))
 squads <- squads %>%
   group_by(matchId) %>%
   mutate(killplcmax = killPlace/maxPlace)
-squads <- squads %>% select(-matchDuration)
+squads <- squads %>% ungroup() %>% select(-matchDuration)
 squads <- squads %>%
   group_by(groupId) %>%
-  mutate(avgwalk = mean(walkDistance),
-  maxwalk = max(walkDistance),
-  avgtotaldist = sum(totaldist),
-  maxtotaldist = max(totaldist),
-  maxkill = max(killPlace),
-  avgkill = mean(killPlace),
-  avgboost = mean(boosts),
-  avgheal = mean(heals),
-  maxhb = max(healsboosts),
-  maxxkillplc = max(killplcmax),
-  teamtotaldmg = sum(damageDealt),
-  teamtotalwpns = sum(weaponsAcquired),
-  teamtotalkills = sum(kills))
+  mutate(groupmembers = n(),
+         avgwalk = mean(walkDistance),
+         maxwalk = max(walkDistance),
+         avgtotaldist = sum(totaldist),
+         maxtotaldist = max(totaldist),
+         maxkill = max(killPlace),
+         avgkill = mean(killPlace),
+         avgboost = mean(boosts),
+         avgheal = mean(heals),
+         maxhb = max(healsboosts),
+         maxxkillplc = max(killplcmax),
+         meankillplc = mean(killplcmax),
+         teamtotaldmg = sum(damageDealt),
+         teamtotalwpns = sum(weaponsAcquired),
+         teamtotalkills = sum(kills))
 
 squads <- squads %>% 
   group_by(matchId) %>%
-  mutate(norm_avgwalk = normalized(avgwalk),
-         norm_maxwalk = normalized(maxwalk),
-         norm_avgtotaldist = normalized(avgtotaldist),
-         norm_maxtotaldist = normalized(maxtotaldist),
-         norm_maxkill = normalized(maxkill),
-         norm_avgkill = normalized(avgkill),
-         norm_avgboost = normalized(avgboost),
-         norm_avgheal = normalized(avgheal),
-         norm_maxhb = normalized(maxhb),
+  mutate(norm_groupmembers = normalized(groupmembers),
          norm_maxxkillplc = normalized(maxxkillplc),
-         norm_totaldmg = normalized(teamtotaldmg),
+         norm_avgkillplc = normalized(maxxkillplc),
          rank_avgwalk = rank(avgwalk),
          rank_maxwalk = rank(maxwalk),
          rank_avgtotaldist = rank(avgtotaldist),
@@ -131,17 +131,20 @@ squads <- squads %>%
          sumtotaldist = sum(totaldist),
          totalwpns = sum(weaponsAcquired),
          totalkills = sum(kills),
-         avgwalkdist = mean(walkDistance))
-
+         avgwalkdist = mean(walkDistance),
+         totalmeankillplc = mean(killplcmax),
+         totalmaxxkillplc = max(killplcmax))
+#Create new features based on created variables#
 squads <- squads %>%
   mutate(distwpns = avgtotaldist/teamtotalwpns,
          wpndiff = teamtotalwpns/totalwpns,
          walkdiff = walkDistance/avgwalkdist,
          distdiff = avgtotaldist/sumtotaldist,
          tmkilldif = teamtotalkills/totalkills,
-         killdiff = kills/avgwalkdist)
+         killdiff = kills/avgwalkdist,
+         teamkilldiff = teamtotalkills/avgtotaldist)
 
-
+#Create Squads Model#
 set.seed(1233)
 squadind <- sample(2, nrow(squads), replace = T, prob = c(0.8, 0.2))
 trainsquad <- squads[squadind==1,]
@@ -150,26 +153,36 @@ trainsquad <- trainsquad %>%
   ungroup()
 testsquad <- testsquad %>%
   ungroup()
-trainsquadm <- data.matrix(select(trainsquad,-matchId, -winPlacePerc))
+trainsquadm <- data.matrix(select(trainsquad,-matchId, -winPlacePerc, -groupId))
 train_label_squad <- trainsquad$winPlacePerc
 train_matrix_squad <- xgb.DMatrix(data = as.matrix(trainsquadm), label = train_label_squad)
-testsquadm <- data.matrix(select(testsquad,-matchId, -winPlacePerc))
+testsquadm <- data.matrix(select(testsquad,-matchId, -winPlacePerc, -groupId))
 test_label_squad <- testsquad$winPlacePerc
 test_matrix_squad <- xgb.DMatrix(data = as.matrix(testsquadm), label = test_label_squad)
-
+#List Parameters#
 xgb_params2 <- list("objective" = "reg:linear",
-                   "eval_metric" = "mae")
+                    "eval_metric" = "mae")
 watchlistsq <- list(train = train_matrix_squad, test = test_matrix_squad)
 
+rm(duosquads, squads)
+gc()
+#Train Squads Model#
 bst_modelsq <- xgb.train(params = xgb_params2,
-                       data = train_matrix_squad,
-                       nrounds = 800,
-                       watchlist = watchlistsq,
-                       eta = .3,
-                       print_every_n = 10,
-                       seed = 333)
+                         data = train_matrix_squad,
+                         nrounds = 1500,
+                         watchlist = watchlistsq,
+                         eta = .3,
+                         print_every_n = 100,
+                         max_depth = 6,
+                         subsample = 0.8,
+                         nthread=8,
+                         colsample_bytree = 0.8,
+                         seed = 333)
 
-testing <-fread('../input/test_V2.csv')
+rm(trainsquad, testsquad, train_matrix_squad, test_matrix_squad)
+gc()
+#Apply training features to testing set#
+testing <-fread("../input/test_V2.csv")
 testing$matchType1 <- testing$matchType
 testing$matchType1 <- gsub(".*squad.*", "squad", testing$matchType1)
 testing$matchType1 <- gsub(".*solo.*", "solo", testing$matchType1)
@@ -183,11 +196,13 @@ testing$healsboosts <- testing$heals  + testing$boosts
 
 
 
-####winners####
+#Split testing data into solo and squads#
 solo <- testing[testing$matchType1 == "solo" | testing$matchType1 == "other" | testing$matchType1 == "crash",]
 duosquad <- testing[testing$matchType1 == "squad" | testing$matchType1 == "duo",]
 
-
+rm(testing)
+gc()
+#Feature mutation#
 solodf <- subset(solo, select = -c(groupId, Id, matchType, matchType1, DBNOs, revives, teamKills))
 solodf <- solodf %>%
   group_by(matchId) %>%
@@ -196,30 +211,36 @@ solomutate <- solodf %>%
   group_by(matchId) %>%
   mutate_all(.funs = funs(normalized, rank))
 solomutate <- as.data.frame(solomutate)
-solomutate <- solomutate %>% select(-matchId)
-
-
+solomutate <- solomutate %>% ungroup() %>% select(-matchId)
+solomutate <- solomutate[,colSums(is.na(solomutate)) == 0]
+rm(solodf)
+gc()
 
 ####Solo Modeling####
-
+#Predict solo winPlacePerc using solo XGBoost algorithm#
 solomutate$winPlacePerc <- predict(bst_model, data.matrix(solomutate))
-solomutate$winPlacePerc <- ifelse(solomutate$winPlacePerc < .01, 0, solomutate$winPlacePerc)
+#Post process predictions#
 solomutate$winPlacePerc <- ifelse(solomutate$winPlacePerc > 1, 1, solomutate$winPlacePerc)
+solomutate$winPlacePerc <- ifelse(solomutate$winPlacePerc < 0, 0, solomutate$winPlacePerc)
 solomutate$winPlacePerc <- ifelse(solomutate$maxPlace == 0, 0, solomutate$winPlacePerc)
 solomutate$winPlacePerc <- ifelse(solomutate$maxPlace == 1, 1, solomutate$winPlacePerc)
-solofinal <- cbind(solomutate, solo[,solo$Id])
+sl <- solo[,1]
+solofinal <- cbind(solomutate, sl)
+solofinal <- solofinal[,c(55,54)]
 ####Squads Modeling####
-
+rm(solomutate, solo)
+gc()
+#Perform feature mutation on squads#
 squads <- duosquad
 squads <- squads %>%
   group_by(matchId) %>%
   mutate(killplcmax = killPlace/maxPlace)
 squads <- squads %>%
   group_by(groupId) %>%
-  mutate(avgwalk = mean(walkDistance),
-         maxpred = max(predictedtime),
+  mutate(groupmembers = n(),
+         avgwalk = mean(walkDistance),
          maxwalk = max(walkDistance),
-         avgtotaldist = mean(totaldist),
+         avgtotaldist = sum(totaldist),
          maxtotaldist = max(totaldist),
          maxkill = max(killPlace),
          avgkill = mean(killPlace),
@@ -227,24 +248,17 @@ squads <- squads %>%
          avgheal = mean(heals),
          maxhb = max(healsboosts),
          maxxkillplc = max(killplcmax),
-         totaldmg = sum(damageDealt))
+         meankillplc = mean(killplcmax),
+         teamtotaldmg = sum(damageDealt),
+         teamtotalwpns = sum(weaponsAcquired),
+         teamtotalkills = sum(kills))
 
 squads <- squads %>% 
   group_by(matchId) %>%
-  mutate(norm_avgwalk = normalized(avgwalk),
-         norm_maxpred = normalized(maxpred),
-         norm_maxwalk = normalized(maxwalk),
-         norm_avgtotaldist = normalized(avgtotaldist),
-         norm_maxtotaldist = normalized(maxtotaldist),
-         norm_maxkill = normalized(maxkill),
-         norm_avgkill = normalized(avgkill),
-         norm_avgboost = normalized(avgboost),
-         norm_avgheal = normalized(avgheal),
-         norm_maxhb = normalized(maxhb),
+  mutate(norm_groupmembers = normalized(groupmembers),
          norm_maxxkillplc = normalized(maxxkillplc),
-         norm_totaldmg = normalized(totaldmg),
+         norm_avgkillplc = normalized(maxxkillplc),
          rank_avgwalk = rank(avgwalk),
-         rank_maxpred = rank(maxpred),
          rank_maxwalk = rank(maxwalk),
          rank_avgtotaldist = rank(avgtotaldist),
          rank_maxtotaldist = rank(maxtotaldist),
@@ -254,19 +268,45 @@ squads <- squads %>%
          rank_avgheal = rank(avgheal),
          rank_maxhb = rank(maxhb),
          rank_maxxkillplc = rank(maxxkillplc),
-         rank_totaldmg = rank(totaldmg))
-squads <- squads %>% select(-matchId, -groupId, -Id, -matchType, -matchType1)
+         rank_totaldmg = rank(teamtotaldmg),
+         totaldmg = sum(damageDealt),
+         totalwalk = sum(walkDistance),
+         sumtotaldist = sum(totaldist),
+         totalwpns = sum(weaponsAcquired),
+         totalkills = sum(kills),
+         avgwalkdist = mean(walkDistance),
+         totalmeankillplc = mean(killplcmax),
+         totalmaxxkillplc = max(killplcmax))
 
+squads <- squads %>%
+  mutate(distwpns = avgtotaldist/teamtotalwpns,
+         wpndiff = teamtotalwpns/totalwpns,
+         walkdiff = walkDistance/avgwalkdist,
+         distdiff = avgtotaldist/sumtotaldist,
+         tmkilldif = teamtotalkills/totalkills,
+         killdiff = kills/avgwalkdist,
+         teamkilldiff = teamtotalkills/avgtotaldist)
+
+squads <- squads %>% 
+  ungroup() %>%
+  select(-matchId, -groupId, -Id, -matchType, -matchType1, -matchDuration)
+
+#Predict winPlacePerc for squads#
 squads$winPlacePerc <- predict(bst_modelsq, data.matrix(squads))
-squads$winPlacePerc <- ifelse(squads$winPlacePerc < .01, 0, squads$winPlacePerc)
+#Post process predictions#
 squads$winPlacePerc <- ifelse(squads$winPlacePerc > 1, 1, squads$winPlacePerc)
+squads$winPlacePerc <- ifelse(squads$winPlacePerc < 0, 0, squads$winPlacePerc)
 squads$winPlacePerc <- ifelse(squads$maxPlace == 0, 0, squads$winPlacePerc)
 squads$winPlacePerc <- ifelse(squads$maxPlace == 1, 1, squads$winPlacePerc)
 squads$winPlacePerc <- ifelse(squads$maxPlace > 1 & squads$numGroups == 1, 0, squads$winPlacePerc)
-squadsfinal <- cbind(squads, duosquad[,c(matchId, groupId, Id)])
+squads$winPlacePerc <- ifelse(squads$numGroups == 1, 0, squads$winPlacePerc)
+sq <- duosquad[,c(1:3)]
+squadsfinal <- cbind(squads, sq)
 squadsfinal <- squadsfinal %>%
-    group_by(groupId) %>%
-    mutate(winPlacePerc = mean(winPlacePerc))
+  group_by(groupId, matchId) %>%
+  mutate(winPlacePerc = mean(winPlacePerc))
+squadsfinal <- squadsfinal %>% ungroup() %>% select(-groupId, -matchId)
+squadsfinal <- squadsfinal[,c(73,72)]
 final <- rbind(squadsfinal, solofinal)
-write.csv("submission.csv", final)
-
+#write final submission csv#
+write.csv(final, "submission.csv", row.names = FALSE)
