@@ -1,0 +1,469 @@
+---
+title: "Housing Prices: EDA and Regression Techniques"
+author: "Brayden Ross"
+date: "February 26, 2019"
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+---
+
+```{r setup, include=FALSE}
+library(data.table)
+library(caret)
+library(factoextra)
+library(randomForest)
+library(xgboost)
+library(ggrepel)
+library(dplyr)
+library(ggplot2)
+library(zoo)
+library(purrr)
+library(Metrics)
+library(glmnet)
+library(ipred)
+library(reshape2)
+library(corrplot)
+library(ggfortify)
+library(tidyr)
+library(kableExtra)
+```
+
+## Housing Prices and EDA
+
+This is an exploratory analysis of the data and use of regression techniques for the housing prices data set in relation to the Kaggle competition [*House Prices: Advanced Regression Techniques*](https://www.kaggle.com/c/house-prices-advanced-regression-techniques).
+
+The EDA will be using the **training** dataset provided in the competition. Note that some of these insights may be personal to me, and are not imperative to performing well in the competition.
+
+Alright, onward!
+
+Time to load our training data.
+
+Let's look at the dimensions of our dataset
+
+```{r load training, include = FALSE}
+training <- read.csv("train.csv")
+```
+
+```{r training, echo=TRUE}
+dim(training)
+```
+Looks like its a relatively small dataset, but with lots of features! 
+Lets see what kind of data is conatined in this dataset by looking at the type of the first 10 columns.
+```{r, echo = FALSE}
+str(training[,1:10])
+```
+There are a mix of characters and integer columns in this dataframe. Some of the characters look like they're descriptive in nature, others look like they might be binary. So it may be worth it to convert those to numerical 1's and 0's in the future.
+
+How many columns are numeric and how many are characters? Let's look.
+
+```{r, echo=FALSE}
+table(sapply(training, class))
+```
+Wow! Over half our columns are characters. That means we'll be doing some dummy variable manipulation in the future.
+
+Time to do some graphing with our good old friend ggplot2. Let's do a preliminary graph and look at all variables in relation to Y. Some of these will be dirty, but we'll see if we can't extract anything of value.
+
+A full description of all the variables can be found [here.](https://www.kaggle.com/c/house-prices-advanced-regression-techniques/data)
+
+##Overall Plotting
+```{r, echo = FALSE, warning=FALSE}
+training %>%
+  keep(is.numeric) %>%
+  gather(-SalePrice, key = "some_var_name", value = "some_value_name") %>%
+  ggplot(aes(x = some_value_name, y = SalePrice)) +
+    geom_point(size = .4) +
+    facet_wrap(~ some_var_name, scales = "free") +  theme(axis.title.x = element_blank(),
+                                                             axis.title.y = element_blank(),
+                                                             axis.text.x = element_blank(),
+                                                             axis.text.y = element_blank(),
+                                                             axis.ticks.x = element_blank(),
+                                                             axis.ticks.y = element_blank())
+
+```
+
+Now let's examine what we just found. All these variables are plotted on the X-axis in relation to our dependent variable, Sale Price. We're looking for some good information to move forward with, and we've found some good stuff. 
+Take a look at 1stFlrSF (First floor square footage), it looks like theres a linear relationship between that and sale price. Makes sense, bigger houses cost more. 
+
+In addition, it looks like GrLivArea (Above ground living area) has a very linear relationship with Sale Price. Let's take a closer look at that variable.
+
+```{r, echo = FALSE}
+ggplot(data = training, aes(x = GrLivArea, y = SalePrice)) + geom_point(color = "Blue") + labs(x= "GrLivArea", y = "SalePrice")
+```
+
+Looks as we expected, very linear relationship between these variables! However, what're those to points in the bottom right? 
+
+```{r, echo = FALSE}
+ggplot(data = training, aes(x = GrLivArea, y = SalePrice)) + geom_point(color = "Blue") +
+  geom_point(data = training[training$GrLivArea > 4500,], aes(x = GrLivArea, y = SalePrice), color = "Red", shape = 21, fill = "Red", size = 5) + labs(x= "GrLivArea", y = "SalePrice")
+```
+
+Very large living area, but very low sale price! That doesn't make sense... More than likely these are farms, large plots of land or just misinformation. Whatever it may be, we should remove them from our training data to help our predictive algorithm be more accurate.
+
+```{r}
+training <- training[training$GrLivArea <= 4500,]
+```
+```{r, echo = FALSE}
+ggplot(data = training, aes(x = GrLivArea, y = SalePrice)) + geom_point(color = "Blue") + labs(x= "GrLivArea", y = "SalePrice")
+```
+
+Much better! It's okay to remove observations from a dataset **_as long as you have a viable reason to do so and it's not a large chunk of your data_**. You should always have a sound reason for removing data, if you don't, you're hurting your algorithms chances of succeeding in prediction. Be **very** cautious when removing observations. 
+
+##Distribution Analysis
+
+As we did above, it's important to observe the descriptive statistics of the data. In addition it's important to see how the data is distributed across the dataset. 
+
+Like our plots above, lets examine the distribution of all our numerical variables. 
+
+```{r, warning=FALSE, echo = FALSE}
+training %>%
+  keep(is.numeric) %>%
+  gather() %>%
+  ggplot(aes(value)) +
+  facet_wrap(~key, scales = "free") + geom_density() + theme(axis.title.x = element_blank(),
+                                                             axis.title.y = element_blank(),
+                                                             axis.text.x = element_blank(),
+                                                             axis.text.y = element_blank(),
+                                                             axis.ticks.x = element_blank(),
+                                                             axis.ticks.y = element_blank())
+```
+
+It seems that some of the distributions are skewed. When we're doing EDA, we should look for normal distributions in our data. These are the most optimal for statistical analysis (things such as t-stats rely on a normal distribution). In addition, anyone wanting to use a lasso regression technique should definitely use normalization for their variables. If a variable has a positive skewness, most of the time a simple log function will work.
+
+```{r, echo = FALSE, message=FALSE}
+ggplot(data = training, aes(x = SalePrice)) + geom_histogram(aes(y=..density..), color = "black", fill = "white") +
+  geom_density(size = 1) + stat_function(fun = dnorm, color = "red", args = list(mean = mean(training$SalePrice),sd = sd(training$SalePrice)), size = 1)
+
+```
+
+Positive skewness! The red line indicates a normal distribution of data, and the black line shows us the current distribution. Now that we've found this, we'll use a handy tool called qqnorm() which is a function in R that generates a scatter plot of observations and compares them to a normal distribution line. this way we can see how close or far our data is from having normal distribution.
+
+```{r}
+qqnorm(training$SalePrice)
+qqline(training$SalePrice)
+```
+
+Just as we suspected. A visible difference. So let's work some statistical mumbo-jumbo and change it! 
+
+```{r}
+training$SalePrice <- log(training$SalePrice)
+```
+
+```{r, echo = FALSE, message=FALSE}
+ggplot(data = training, aes(x = SalePrice)) + geom_histogram(aes(y=..density..), color = "black", fill = "white") +
+  geom_density(size = 1) + stat_function(fun = dnorm, color = "red", args = list(mean = mean(training$SalePrice),sd = sd(training$SalePrice)), size = 1)
+
+```
+
+```{r}
+qqnorm(training$SalePrice)
+qqline(training$SalePrice)
+```
+
+And just like that, we have a normally distributed prediction variable. **IMPORTANT :** You *_must_* change the predictor variable back to its original form for submissions.(i.e. don't leave it as a log)
+
+##Preliminary Correlations
+
+A valuable tool for EDA is a [correlation matrix.](https://www.r-graph-gallery.com/199-correlation-matrix-with-ggally/) This can show preliminary correlations that will be valuable to you in your analysis later on, things such as dimensionality reduction and feature engineering. 
+
+Let's make a basic matrix for our training data.
+
+```{r, echo = FALSE}
+trainmatrix <- training %>%
+  keep(is.numeric) %>%
+  select(-Id, -LotFrontage, -GarageYrBlt, -MasVnrArea)
+cormat <- cor(trainmatrix)
+melted <- melt(cormat)
+ggplot(data = melted, aes(x=Var1, y=Var2, fill = value)) + geom_tile() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Gross. That looks gross. Let's clean it up a bit, and make sure we're examining the important relationships without all the noise.
+
+```{r, echo = FALSE}
+  get_lower_tri<-function(cormat){
+    cormat[upper.tri(cormat)] <- NA
+    return(cormat)
+  }
+  get_upper_tri <- function(cormat){
+    cormat[lower.tri(cormat)]<- NA
+    return(cormat)
+  }
+  reorder_cormat <- function(cormat){
+    dd <- as.dist((1-cormat)/2)
+    hc <- hclust(dd)
+    cormat <-cormat[hc$order, hc$order]
+  }
+  cormat <- reorder_cormat(cormat)
+  upper_tri <- get_upper_tri(cormat)
+  melted2 <- melt(upper_tri, na.rm = TRUE)
+ggplot(melted2, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+ scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+   midpoint = 0, limit = c(-1,1), space = "Lab", 
+    name="Pearson\nCorrelation") +
+  theme_minimal()+ # minimal theme
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))+
+ coord_fixed()
+```
+
+We can now examine the correlations between our variables to provide accurate and efficient feature extraction, dimensionality reduction and statistical analysis! Correlation matrices are great tools to visualize and get a grasp of you data without too much work! 
+
+Another great EDA technique is to use Principle Component Analysis, or PCA for short. This shows any groupings and/or clusters the data may have and what factors influence these clusters at what magnitude. This can help us identify potential groupings and important variables in future algorithms. We'll examine the numerical components of our dataset here.
+
+```{r, echo = F}
+pcatrain <- training %>%
+  keep(is.numeric) %>%
+  select(-MasVnrArea, -LotFrontage, -GarageYrBlt, -SalePrice)
+prout <- prcomp(pcatrain, scale. = TRUE)
+autoplot(prout)
+vars <- get_pca_var(prout)
+vars <- as.data.frame(vars$contrib)
+```
+
+There seems to be one large clustering with no real separation between either principle component. It seems that both components have equal effects on the data, and there are no real clusters worth mentioning.
+
+To further examine this, lets look at the factors that most affect the respective principle components.
+
+```{r, echo = F}
+vars <- vars[order(vars$Dim.1, decreasing = TRUE),]
+row.names(vars[1:5,])
+```
+
+In PCA1, the top variables affecting grouping of homes are living area, overall quality, area and number of cars a garage has, and how many full baths are in the home. This makes sense, as many of these 
+are obvious factors when determining a home purchase.
+
+```{r, echo = F}
+vars <- vars[order(vars$Dim.2, decreasing = TRUE),]
+row.names(vars[1:5,])
+```
+
+In PCA2, the top variables are 2nd floor square footage, number of bedrooms above ground, square footage of finished basement space, how many full baths are in teh basement, and the number of rooms above ground. Again, this makes sense logically, as you would be looking for a house in a range that has some elements of both principle components. With only a few outlying observations, the PCA analysis shows that we have a dataset where there is no real separation in homes that can be defined as significant groups, most homes are grouped the same way. 
+
+##Data Munging
+
+The approach to this problem that we saw fit was to separate the numeric and character variables into two data frames, and alter the data from that point forward.
+
+A few imputed variables that were used:
+
+* **totalSF**: this is the sum total of all square footage in the home (Basement + First Floor + Second Floor)
+* **yardsize**: this is the portion of the first floor square footage in relation to the entire yard (First Floor / Lot Area)
+* **remodelbuilt**: this is a binary for any remodels that occured in the same year the home was built
+* **unfbsmt**: this is a binary for any basements that were unfinished at the time of sale
+
+```{r, echo = FALSE}
+rm(training, testing)
+training <- read.csv('train.csv')
+testing <- read.csv('test.csv')
+training <- training[training$GrLivArea <= 4500,]
+trainnum <- training %>%
+  select_if(is.numeric)
+testnum <- testing %>%
+  select_if(is.numeric)
+trainnum <- trainnum %>%
+  mutate(totalSF = `X1stFlrSF` + `X2ndFlrSF` + `TotalBsmtSF`,
+         yardsize = `X1stFlrSF` / LotArea,
+         remodelbuilt = ifelse(YearRemodAdd == YearBuilt, 1, 0),
+         YrSold = as.factor(YrSold))
+testnum <- testnum %>%
+  mutate(totalSF = `X1stFlrSF` + `X2ndFlrSF` + `TotalBsmtSF`,
+         yardsize = `X1stFlrSF` / LotArea,
+         remodelbuilt = ifelse(YearRemodAdd == YearBuilt, 1, 0),
+         YrSold = as.factor(YrSold))
+```
+
+Lots of numeric columns contained NA values, and to deal with this the mean of the column was imputed for NAs. Character columns also included NA values, and to fix those the most common occurence in the column was used to impute for NAs.
+
+In the character dataframe, we examined the levels of each individual column and compared them to the testing set. If the levels were equal after NA removal, then I kept the column. If they were not, then the column was removed. All remaining columns were converted to factors.
+
+```{r, echo = FALSE, warning=FALSE, message=FALSE}
+for(i in 1:ncol(trainnum)){
+  trainnum[is.na(trainnum[,i]), i] <- mean(trainnum[,i], na.rm = TRUE)
+}
+for(i in 1:ncol(testnum)){
+  testnum[is.na(testnum[,i]), i] <- mean(testnum[,i], na.rm = TRUE)
+}
+trainchar <- training %>%
+  select_if(negate(is.numeric))
+testchar <- testing %>%
+  select_if(negate(is.numeric))
+trainchar <- as.data.frame(apply(trainchar, 2, function(x){ 
+  x[is.na(x)] <- names(which.max(table(x)))
+  return(x) }))
+testchar <- as.data.frame(apply(testchar, 2, function(x){ 
+  x[is.na(x)] <- names(which.max(table(x)))
+  return(x) }))
+#Finding Same Level Factors#
+df <- as.data.frame(sapply(trainchar, function(x) length(unique(x))))
+df$newcol <- 0
+df$newcol <- as.data.frame(sapply(testchar, function(x) length(unique(x))))
+df$binary <- ifelse(df$`sapply(trainchar, function(x) length(unique(x)))` == df$newcol, 1, 0)
+df <- subset(df, df$binary == 1)
+list <- row.names(df)
+trainchar$unfbsmt <- ifelse(trainchar$BsmtFinType1 == "Unf", 1, 0)
+testchar$unfbsmt <- ifelse(testchar$BsmtFinType1 == "Unf", 1, 0)
+trainchar <- trainchar %>%
+  select(list, unfbsmt)
+testchar <- testchar %>%
+  select(list, unfbsmt)
+trainchar <- mutate_if(trainchar, is.character, as.factor)
+testchar <- mutate_if(testchar, is.character, as.factor)
+training <- cbind(trainchar, trainnum)
+testing <- cbind(testchar, testnum)
+```
+
+##Regression Analysis
+
+After extracting features and manipulating the data, it's time to start running some algorithms. First, we split the data into training and testing sets using a data partition.
+
+
+```{r, echo = FALSE, warning=FALSE, message=FALSE}
+set.seed(1234)
+inTrain <- createDataPartition(y=training$SalePrice, p=0.7, list=FALSE)  
+train <- training[inTrain,]
+test <- training[-inTrain,]
+rm(inTrain)
+```
+
+The first model is a linear regression model, very basic, yet still somewhat informative.
+
+```{r, echo = FALSE, warning=FALSE, message=FALSE}
+#Linear Regression Model#
+lm1 <- lm(SalePrice~.-Id, data = training)
+pred1 <- predict(lm1, training)
+coefs <- summary(lm1)$coefficients
+vars <- rownames(coefs)[which(coefs[, 4] < 0.05)]
+vardf <- data.frame(matrix(nrow=10, ncol=6))
+vardf[is.na(vardf)] <-0
+vardf$X1 <- vars[1:10]
+vardf$X2 <- vars[11:20]
+vardf$X3 <- vars[21:30]
+vardf$X4 <- vars[31:40]
+vardf$X5 <- vars[41:50]
+vardf[1:5,6] <- vars[51:55]
+vardf$X6 <- ifelse(vardf$X6 == 0, "", vardf$X6)
+colnames(vardf) <- c("", "", "", "", "", "")
+```
+```{r,echo = F}
+kable(vardf, caption = "Significant Variables at the 95% Level") %>%
+  kable_styling(bootstrap_options = "striped", full_width = F, position = "center")
+```
+
+So how did our linear model perform? Well, examining the summary of variables significant at the 95% level, we can begin to make some observations about what our model is using to make predictions. It seems that neighborhood is very improtant when determining the price of home, in addition to the zoning of the home sites. 
+
+In addition, using our evaluation metric of root mean squared logarithmic error (RMSLE), we can see that the linear regression comes out with a result of `r rmsle(actual = test$SalePrice, predicted = pred1)`. Not too bad for something so simple! 
+
+After linear regression, we explored some other options using ridge and lasso regression. This involves finding optimal lambdas for our costs. Below are the results for the Ridge Regression.
+
+```{r, echo = F, warning=FALSE, message=FALSE}
+y <- train$SalePrice
+x <- train %>% select(-Id, -SalePrice) %>% data.matrix()
+x2 <- test %>% select(-Id, -SalePrice) %>% data.matrix()
+x3 <- testing %>% select(-Id) %>% data.matrix()
+lambdas <- 10^seq(6, -2, by = -.1)
+glm1 <- glmnet(x, y, alpha = 0, lambda = lambdas)
+cv_fit <- cv.glmnet(x, y, alpha = 0, lambda = lambdas)
+opt_lambda <- cv_fit$lambda.min
+glm1 <- glmnet(x, y, alpha = 0, lambda = opt_lambda)
+pred2 <- as.vector(predict(glm1, newx = x2))
+```
+
+```{r, echo = F}
+plot(cv_fit)
+```
+
+As we can see above, the optimal lambda for Ridge is somewhere around log(10). We can find this exactly using `cv.glmnet`. It turns out the optimal lambda in this case is exactly `r cv_fit$lambda.min`. We can then use this to optimize our algorithm by setting the lambda parameter equal to this number.
+
+After doign so, we have our optimized ridge regression, and it's RMSLE comes out to `r rmsle(actual = test$SalePrice, predicted = pred2)`. A significant improvement from the previous model! 
+
+We can perform the same steps for our lasso regression, however this time we'll set our `alpha = 1` instead of 0 this time to specify our glm as a lasso.
+
+
+```{r, echo = F, warning = F, message=F}
+#Lasso Regression#
+glm2 <- glmnet(x, y, alpha = 1, lambda = lambdas)
+cv_fit2 <- cv.glmnet(x, y, alpha = 0, lambda = lambdas)
+opt_lambda2 <- cv_fit2$lambda.min
+glm2 <- glmnet(x, y, alpha = 1, lambda = opt_lambda2)
+pred3 <- as.vector(predict(glm2, newx = x2))
+
+```
+```{r,echo = F}
+plot(cv_fit2)
+```
+
+After implementing the same steps as before, we can see that our lasso lambda is most likely somewhere around log(10) as well. Using R, we find the exact value to be `r cv_fit2$lambda.min`. After implementing this and re-running the algorithm, we get a RMSLE of `r rmsle(actual = test$SalePrice, predicted = pred3)`. We're doing better and better! 
+
+Now on to some more complex algorithms.
+
+Now we'll try a random forest. As mentioned above, we don't have to standardize our data for some algorithms. Random Forest is one of these, and as such we can run with our data as is.
+
+```{r, echo = F}
+rf1 <- randomForest(SalePrice~.-Id, data = train, ntree = 300, mtry = 16)
+rfpred <- predict(rf1, test)
+plot(rf1)
+```
+
+To optimize our random forest, we'll need to determine how many trees to use, and how many variables to try at each split. Examining the graph above we can determine that there is no real value added past 300 trees, so we can cut it down to that threshold. 
+
+```{r,echo = F}
+t <- tuneRF(training[,-71], training[,71], stepFactor = 1.5,
+            ntreeTry = 300, trace = TRUE, plot = TRUE)
+```
+
+Using `tuneRF` we can find the optimal mtry or number of variables to try at each split. In this case, it looks like our optimal mtry is at `r min(t)`
+
+Now that we've tuned our random forest parameters, we can find our best RMSLE. It comes out to `rmsle(actual = test$SalePrice, predicted = rfpred)`. Not too bad! Let's try one more algorithm, a boosting algorithm.
+
+Using XGBoost, we can tune our many parameters given to us to hopefully optimize our error rate and get some good predictions. 
+
+```{r, echo = F, warning=F, message=F, results = 'hide'}
+#XGBoosting#
+trainm <- data.matrix(select(train,-SalePrice, -Id))
+train_label<- train$SalePrice
+train_matrix <- xgb.DMatrix(data = as.matrix(trainm), label = train_label)
+testm <- data.matrix(select(test,-SalePrice, -Id))
+test_label <- test$SalePrice
+test_matrix <- xgb.DMatrix(data = as.matrix(testm), label = test_label)
+
+#List Parameters for XGBoost#
+xgb_params <- list("objective" = "reg:linear",
+                  "eval_metric" = "rmse")
+watchlist <- list(train = train_matrix, test = test_matrix)
+bst_model <- xgb.train(params = xgb_params,
+                       data = train_matrix,
+                       nrounds = 1100,
+                       watchlist = watchlist,
+                       eta = .3,
+                       print_every_n = 10)
+```
+```{r, echo = F}
+head(xgb.importance(model = bst_model))
+xgbpredfirst <- predict(bst_model, data.matrix(test))
+```
+
+So now that we've run our XGBoost algorithm with 1100 rounds and a learning rate of .3, our RMSLE comes out to `rmsle(actual = test$SalePrice, predicted = xgbpredfirst)`. Wow! Looks like boosting doesn't do too well here. So for our purposes we'll stick with lasso, ridge and random forests.
+
+#Ensemble
+
+Now we can try another method, ensembling the previous models using bagging. If we combine all predictive objects into one data frame and run a bagging function to predict the actual sale price, we can determine if an ensemble method is preferable to the best model so far. 
+
+```{r, echo = F, message = F, warning = F}
+#Ensembling#
+testpreds <- test$SalePrice
+preddf <- data.frame(pred2, pred3, rfpred, testpreds)
+colnames(preddf) <- c("Ridge", "Lasso", "Random Forest", "SalePrice")
+ensembled <- bagging(SalePrice~., data = preddf, nbagg = 100)
+testing$Ridge <- as.vector(predict(glm1, newx = x3))
+testing$Lasso <- as.vector(predict(glm2, newx = x3))
+testing$`Random Forest` <- predict(rf1, testing)
+testing <- testing[,c(34, 74:76)]
+Id <- testing$Id
+testing <- testing %>%
+  select(-Id)
+newpred <- predict(ensembled, newdata=testing)
+bestpred <- as.data.frame(cbind(Id, newpred))
+```
+
+Using 100 bags, we can get a good idea of our ensemble algorithms predictive power. Looking at our RMSLE, it comes out to `r rmsle(actual = test$SalePrice, predicted = bestpred$newpred)`. Looks like the ensemble method doesn't beat out our ridge regression! So we'll use that for the submission.
+
+Thank you for taking the time to read my analysis and EDA. Any feedback is appreciated and welcome! 
